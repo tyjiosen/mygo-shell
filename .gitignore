@@ -1,0 +1,7 @@
+/build/
+/.mygo/
+mygo_windows_*.syso
+
+# Installed by `mygo install-skills`, and editor settings that name local paths.
+/.agents/
+/.vscode/
