@@ -5,6 +5,8 @@ A Xshell-style desktop terminal in Go: SSH sessions and local shells in one tabb
 
 界面用 [MyGo](https://github.com/egoist/mygo) 的原生 UI 画，终端仿真用 [Ghostty](https://github.com/ghostty-org/ghostty) 的 VT 核心（libghostty-vt）。
 
+![mygo-shell 主界面：左侧会话列表与属性窗格，右侧多标签终端](docs/screenshot.png)
+
 ## 功能
 
 - **多标签**：本地 shell 与 SSH 会话共用标签栏。标签左端的状态点表示连接状态 —— 绿=正常、琥珀=连接中、红=已断开或连接失败、灰=本地 shell
