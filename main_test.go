@@ -432,6 +432,177 @@ func TestTabOpensWhileConnecting(t *testing.T) {
 	t.Fatalf("the tab never connected: %q", item.errMsg)
 }
 
+// TestKeyboardInteractiveAsksTheFrame checks that the questions a server asks
+// through keyboard-interactive reach the dialog, and that its answers connect
+// the tab.
+func TestKeyboardInteractiveAsksTheFrame(t *testing.T) {
+	srv := startTestSSH(t)
+	a := &app{active: -1, dials: make(chan dialResult, 4), asks: make(chan *keyboardAsk, 4)}
+	a.resetForm()
+
+	cfg := sshx.Config{
+		Addr:           srv.addr,
+		User:           "tester",
+		KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts"),
+		HostKeyPolicy:  sshx.HostKeyTrustOnFirstUse,
+		KeyboardInteractive: func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+			return a.askKeyboard(srv.addr, name, instruction, questions, echos)
+		},
+	}
+	item := a.openConnection(cfg, session.Session{ID: "one", Name: "键盘交互"}, "键盘交互")
+	t.Cleanup(func() {
+		if item.term != nil {
+			item.term.Close()
+		}
+	})
+
+	tester := ui.NewTester(a.view, 900, 600)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && a.keyboard == nil {
+		tester.Frame()
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.keyboard == nil {
+		t.Fatalf("the dialog never asked what the server wanted: %q", item.errMsg)
+	}
+	if !tester.HasText("Password: ") {
+		t.Error("the dialog does not show the question of the server")
+	}
+
+	// The dialog shares the answers with the input, so what the user types
+	// reads back from there.
+	a.keyboard.answers[0] = "secret"
+	tester.Frame()
+	if err := tester.Click("确定"); err != nil {
+		t.Fatalf("click 确定: %v", err)
+	}
+
+	for time.Now().Before(deadline) {
+		tester.Frame()
+		if item.term != nil {
+			if item.connecting || item.errMsg != "" {
+				t.Errorf("the tab connected but still says %q", item.errMsg)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the tab never connected: %q", item.errMsg)
+}
+
+// recordConn is a Conn that answers nothing and records what the terminal
+// sends it, which is what the keyboard types.
+type recordConn struct {
+	closed chan struct{}
+	mu     sync.Mutex
+	sent   []byte
+}
+
+func newRecordConn() *recordConn { return &recordConn{closed: make(chan struct{})} }
+
+func (c *recordConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, os.ErrClosed
+}
+
+func (c *recordConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.sent = append(c.sent, p...)
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+func (c *recordConn) Close() error {
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
+	return nil
+}
+
+// Resize keeps the size the view asks for out of the test.
+func (c *recordConn) Resize(cols, rows int) error { return nil }
+
+// text returns what the terminal sent, since it was made.
+func (c *recordConn) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(c.sent)
+}
+
+// took waits for the terminal to send want, which its input queue does from a
+// goroutine of its own, and returns what it sent.
+func (c *recordConn) took(want string) string {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := c.text()
+		if got == want || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestTabInFrontTakesTheFocus checks that the terminal of a tab that comes to
+// the front takes the keys, so that typing goes to it and not to whatever was
+// clicked last, as Xshell puts the cursor in the tab it opens or switches to.
+func TestTabInFrontTakesTheFocus(t *testing.T) {
+	conns := []*recordConn{newRecordConn(), newRecordConn()}
+	tabs := make([]*tab, 0, len(conns))
+	for i, conn := range conns {
+		opts := terminalOptions()
+		opts.Conn = conn
+		term, err := terminal.New(opts)
+		if err != nil {
+			t.Fatalf("terminal %d: %v", i, err)
+		}
+		t.Cleanup(func() { term.Close() })
+		tabs = append(tabs, &tab{title: fmt.Sprintf("标签%d", i+1), term: term, local: true})
+	}
+
+	a := &app{active: 0, tabs: tabs}
+	a.resetForm()
+
+	// A focusable control beside the terminals, as the session dialog of the
+	// app is: it takes the keys when it is clicked, and keeps them.
+	tester := ui.NewTester(func(c *ui.Context) {
+		ui.Column(c).Fill().Children(func() {
+			if ui.Button(c, "别处").Clicked() {
+			}
+			a.content(c, c.Theme())
+		})
+	}, 900, 600)
+
+	tester.Frame()
+	tester.Type("a")
+	if got := conns[0].took("a"); got != "a" {
+		t.Fatalf("typing into the tab in front sent %q", got)
+	}
+
+	// A click elsewhere takes the keys, as the button of a dialog does.
+	if err := tester.Click("别处"); err != nil {
+		t.Fatalf("click 别处: %v", err)
+	}
+	tester.Frame()
+	tester.Type("z")
+	if got := conns[0].text(); got != "a" {
+		t.Fatalf("the terminal took %q while another control had the keys", got)
+	}
+
+	// The next tab comes to the front, as a new one does, and takes the keys
+	// back.
+	a.active = 1
+	tester.Frame()
+	tester.Type("b")
+	if got := conns[1].took("b"); got != "b" {
+		t.Fatalf("typing into the tab that came to the front sent %q", got)
+	}
+	if got := conns[0].text(); got != "a" {
+		t.Fatalf("the tab that left the front took %q too", got)
+	}
+}
+
 // TestTerminalFitsItsTab checks that the screen of a connected tab takes the
 // room of the tab, which the server is told as the size of its pty.
 func TestTerminalFitsItsTab(t *testing.T) {
@@ -699,6 +870,16 @@ func startTestSSH(t *testing.T) *testSSH {
 			}
 			return nil, fmt.Errorf("wrong password")
 		},
+	}
+	config.KeyboardInteractiveCallback = func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+		answers, err := challenge("", "", []string{"Password: "}, []bool{false})
+		if err != nil {
+			return nil, err
+		}
+		if len(answers) == 1 && answers[0] == "secret" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("wrong answer")
 	}
 	config.AddHostKey(signer)
 

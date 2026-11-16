@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -20,9 +21,25 @@ import (
 // probeTimeout is how long the dialogs wait for the server to name itself.
 const probeTimeout = 5 * time.Second
 
-// authKeyboard is the keyboard-interactive method, which the dialog lists as
-// Xshell does, without driving it yet.
-const authKeyboard = "keyboard"
+// keyboardAsk is one round of questions a server asks through
+// keyboard-interactive while a tab connects: the frame shows them, and the
+// goroutine that dials waits for the answers.
+type keyboardAsk struct {
+	remote      string // the server, as the dialog names it
+	name        string // the name of the round, which may be empty
+	instruction string // what the round says, which may be empty
+	questions   []string
+	echos       []bool
+	answers     []string // what the frame gathered, one per question
+	reply       chan keyboardAnswers
+}
+
+// keyboardAnswers is what the frame sends back: what was typed, or why it
+// gave up.
+type keyboardAnswers struct {
+	answers []string
+	err     error
+}
 
 // connStep is the stage of the credential dialogs, which ask the login name
 // and then the way to authenticate, one after the other.
@@ -60,7 +77,7 @@ type connectFlow struct {
 	user         string
 	rememberUser bool
 
-	auth           string   // session.AuthPassword or session.AuthKey
+	auth           string   // session.AuthPassword, AuthKey or AuthKeyboard
 	keyPath        string   // the private key the dialog offers
 	keys           []string // the private keys found in ~/.ssh
 	secret         string   // the password, or the passphrase of the key
@@ -98,6 +115,9 @@ func (a *app) needsCredentials(item session.Session) bool {
 		// A key session with no key to offer has nothing to try.
 		return item.KeyPath == ""
 	case session.AuthAgent:
+		return false
+	case session.AuthKeyboard:
+		// The server asks its questions while the tab connects.
 		return false
 	}
 	if a.store == nil {
@@ -152,9 +172,12 @@ func (a *app) startConnect(item session.Session) {
 		rememberUser: true,
 		keys:         sshKeys(),
 	}
-	// The dialog offers a password and a key: a session that signed in with
-	// an agent, or with nothing recorded, starts from the password.
-	if f.auth != session.AuthKey {
+	// The dialog offers a password, a key and the questions of the server: a
+	// session that signed in with an agent, or with nothing recorded, starts
+	// from the password.
+	switch f.auth {
+	case session.AuthKey, session.AuthKeyboard:
+	default:
 		f.auth = session.AuthPassword
 	}
 
@@ -252,6 +275,13 @@ func (a *app) connectNow() {
 		}
 		cfg.KeyPath = f.keyPath
 		cfg.KeyPassphrase = f.secret
+	case session.AuthKeyboard:
+		// The server asks its questions round by round, and the dialog shows
+		// them while the dial waits for the answers.
+		addr := cfg.Addr
+		cfg.KeyboardInteractive = func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+			return a.askKeyboard(addr, name, instruction, questions, echos)
+		}
 	case session.AuthAgent:
 		cfg.UseAgent = true
 	default:
@@ -303,7 +333,9 @@ func (a *app) saveFlow() session.Session {
 	if !f.rememberUser {
 		stored.User = ""
 	}
-	if f.rememberSecret {
+	// A keyboard-interactive session stores no password: the server asks for
+	// what it wants while the tab connects.
+	if f.rememberSecret && f.auth != session.AuthKeyboard {
 		stored.Password = f.secret
 	}
 	if err := a.store.Save(context.Background(), &stored); err != nil {
@@ -361,6 +393,15 @@ func isPrivateKey(path string) bool {
 // connectDialogs draws the dialogs asking for the credentials of a connection.
 func (a *app) connectDialogs(c *ui.Context, t *ui.Theme) {
 	a.takeProbe()
+	a.takeAsks()
+
+	// A round of keyboard-interactive questions holds a dial that is already
+	// running, so it comes before the credentials of a connection not started
+	// yet.
+	if a.keyboard != nil {
+		a.keyboardDialog(c, t)
+		return
+	}
 
 	switch a.flow.step {
 	case stepUser:
@@ -368,6 +409,136 @@ func (a *app) connectDialogs(c *ui.Context, t *ui.Theme) {
 	case stepAuth:
 		a.authDialog(c, t)
 	}
+}
+
+// askKeyboard asks the frame what a server asked through keyboard-interactive,
+// and waits for the answers: the dial that called it runs beside the dialog.
+func (a *app) askKeyboard(remote, name, instruction string, questions []string, echos []bool) ([]string, error) {
+	if a.asks == nil {
+		return nil, errors.New("sshx: 没有可用于键盘交互提问的界面")
+	}
+
+	ask := &keyboardAsk{
+		remote:      remote,
+		name:        name,
+		instruction: instruction,
+		questions:   questions,
+		echos:       echos,
+		reply:       make(chan keyboardAnswers, 1),
+	}
+
+	select {
+	case a.asks <- ask:
+	default:
+		return nil, errors.New("sshx: 键盘交互提问没有界面接收")
+	}
+	a.invalidate()
+
+	answer := <-ask.reply
+	return answer.answers, answer.err
+}
+
+// takeAsks takes the rounds the servers asked since the last frame, and shows
+// the one that came first.
+func (a *app) takeAsks() {
+	for {
+		select {
+		case ask := <-a.asks:
+			ask.answers = make([]string, len(ask.questions))
+			a.askQueue = append(a.askQueue, ask)
+		default:
+			a.nextAsk()
+			return
+		}
+	}
+}
+
+// nextAsk shows the round waiting longest, which the frame has none of yet.
+func (a *app) nextAsk() {
+	if a.keyboard != nil || len(a.askQueue) == 0 {
+		return
+	}
+	a.keyboard = a.askQueue[0]
+	a.askQueue = a.askQueue[1:]
+}
+
+// submitKeyboard hands the answers of the round on screen to the dial waiting
+// for them.
+func (a *app) submitKeyboard() {
+	ask := a.keyboard
+	if ask == nil {
+		return
+	}
+	a.keyboard = nil
+	a.nextAsk()
+	ask.reply <- keyboardAnswers{answers: ask.answers}
+	a.invalidate()
+}
+
+// cancelKeyboard drops the round on screen, which ends the connection that
+// asked it.
+func (a *app) cancelKeyboard() {
+	ask := a.keyboard
+	if ask == nil {
+		return
+	}
+	a.keyboard = nil
+	a.nextAsk()
+	ask.reply <- keyboardAnswers{err: errors.New("用户取消了键盘交互验证")}
+	a.invalidate()
+}
+
+// keyboardDialog asks what one round of keyboard-interactive asked, as Xshell
+// shows the prompts of the server.
+func (a *app) keyboardDialog(c *ui.Context, t *ui.Theme) {
+	ask := a.keyboard
+
+	title := ask.name
+	if title == "" {
+		title = "SSH 键盘交互"
+	}
+
+	ui.Overlay(c, func() {
+		ui.Column(c).Absolute().Left(280).Top(70).Width(440).
+			Background(t.Background).Border(1, t.Border).Padding(16).Gap(10).
+			Children(func() {
+				ui.Text(c, title).Bold().FontSize(15)
+				if ask.remote != "" {
+					ui.Row(c).Gap(8).Children(func() {
+						ui.Text(c, "远程主机:").Width(76).FontSize(12).TextColor(t.TextMuted)
+						ui.Text(c, ask.remote).FontSize(12).Bold()
+					})
+				}
+				if ask.instruction != "" {
+					ui.Text(c, ask.instruction).FontSize(12)
+				}
+
+				ui.Column(c).Height(1).Background(t.Border)
+
+				for i, question := range ask.questions {
+					secret := i < len(ask.echos) && !ask.echos[i]
+					switch {
+					case question != "" && secret:
+						ui.TextInput(c, &ask.answers[i]).Password().Label(question).FillWidth()
+					case question != "":
+						ui.TextInput(c, &ask.answers[i]).Label(question).FillWidth()
+					case secret:
+						ui.TextInput(c, &ask.answers[i]).Password().FillWidth()
+					default:
+						ui.TextInput(c, &ask.answers[i]).FillWidth()
+					}
+				}
+
+				ui.Row(c).Gap(8).Children(func() {
+					if ui.PrimaryButton(c, "确定").Width(90).Clicked() {
+						a.submitKeyboard()
+					}
+					if ui.Button(c, "取消").Width(90).Clicked() {
+						a.cancelKeyboard()
+					}
+				})
+			})
+	})
 }
 
 // connPanel draws one of the connection dialogs, titled and naming the server,
@@ -470,7 +641,7 @@ func (a *app) authDialog(c *ui.Context, t *ui.Theme) {
 		ui.RadioGroup(c, func() {
 			ui.Radio(c, &a.flow.auth, session.AuthPassword, "密码(P)")
 			ui.Radio(c, &a.flow.auth, session.AuthKey, "公钥(U)")
-			ui.Radio(c, &a.flow.auth, authKeyboard, "键盘交互(I)").Disabled(true)
+			ui.Radio(c, &a.flow.auth, session.AuthKeyboard, "键盘交互(I)")
 		})
 
 		switch a.flow.auth {
@@ -482,13 +653,18 @@ func (a *app) authDialog(c *ui.Context, t *ui.Theme) {
 					Placeholder(`C:\Users\you\.ssh\id_ed25519`).Label("用户密钥(K)").FillWidth()
 			}
 			ui.TextInput(c, &a.flow.secret).Password().Label("密码(H)").FillWidth()
-		case authKeyboard:
-			ui.Text(c, "使用键盘输入用户身份验证。").FontSize(11).TextColor(t.TextMuted)
+		case session.AuthKeyboard:
+			ui.Text(c, "连接时由服务器逐项提问，例如密码和一次性验证码。").
+				FontSize(11).TextColor(t.TextMuted)
 		default:
 			ui.TextInput(c, &a.flow.secret).Password().Label("密码(W)").FillWidth()
 		}
 
-		ui.Checkbox(c, &a.flow.rememberSecret, "记住密码(R)")
+		// A keyboard-interactive session keeps no password: the server asks
+		// again, and the answers never reach the store.
+		if a.flow.auth != session.AuthKeyboard {
+			ui.Checkbox(c, &a.flow.rememberSecret, "记住密码(R)")
+		}
 
 		a.connError(c, t)
 

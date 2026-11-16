@@ -30,6 +30,9 @@ const (
 	AuthPassword = "password"
 	AuthKey      = "key"
 	AuthAgent    = "agent"
+	// AuthKeyboard answers what the server asks through keyboard-interactive,
+	// as a password and a one-time code, each round with its own prompt.
+	AuthKeyboard = "keyboard"
 )
 
 // Session is one saved connection profile. Password is only read when it is
@@ -218,15 +221,15 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // sessionFromRow maps a query row in the order used by List and Get.
 func sessionFromRow(v []any) Session {
 	item := Session{
-		ID:         asString(v[0]),
-		Name:       asString(v[1]),
-		Protocol:   Protocol(asString(v[2])),
-		Host:       asString(v[3]),
-		Port:       asInt(v[4]),
-		User:       asString(v[5]),
-		AuthMethod: asString(v[6]),
-		KeyPath:    asString(v[7]),
-		TermType:   asString(v[8]),
+		ID:          asString(v[0]),
+		Name:        asString(v[1]),
+		Protocol:    Protocol(asString(v[2])),
+		Host:        asString(v[3]),
+		Port:        asInt(v[4]),
+		User:        asString(v[5]),
+		AuthMethod:  asString(v[6]),
+		KeyPath:     asString(v[7]),
+		TermType:    asString(v[8]),
 		HasPassword: asInt(v[9]) != 0,
 	}
 	item.CreatedAt = asTime(v[10])

@@ -107,10 +107,20 @@ type app struct {
 	probes   chan probeResult
 	probeGen int
 
+	// asks carries the keyboard-interactive questions the servers ask while
+	// tabs connect: keyboard is the round on screen, askQueue the ones behind.
+	asks     chan *keyboardAsk
+	keyboard *keyboardAsk
+	askQueue []*keyboardAsk
+
 	// dials carries the connections the tabs are waiting for, and retry is the
 	// tab a connection that failed for want of credentials takes over.
 	dials chan dialResult
 	retry *tab
+
+	// focused is the tab whose terminal took the keys: a tab that comes to the
+	// front takes them over, and a terminal that comes up takes them.
+	focused *tab
 
 	// Deleting asks first: the password of the session goes with it.
 	pendingDelete     string
@@ -888,8 +898,20 @@ func (a *app) content(c *ui.Context, t *ui.Theme) {
 		if a.active >= 0 && a.active < len(a.tabs) {
 			item := a.tabs[a.active]
 			if item.term != nil {
-				terminal.View(c, item.term).Fill().AutoFocus()
+				view := terminal.View(c, item.term).Fill()
+				// The terminal of the tab in front takes the keys, as Xshell
+				// puts the cursor in the tab it opens or switches to. AutoFocus
+				// does not: the view is the same element for every tab, so it
+				// is born once, and the focus stays on whatever was clicked
+				// last, as the button that opened the tab.
+				if a.focused != item {
+					a.focused = item
+					view.Focus()
+				}
 			} else {
+				// There is nothing to type into yet: the terminal takes the
+				// keys as it comes up.
+				a.focused = nil
 				a.idlePane(c, t, item)
 			}
 		}
@@ -1157,6 +1179,24 @@ func sshConfigFromEnv() (sshx.Config, bool) {
 	}, true
 }
 
+// iconPNG returns the icon the window shows in its title bar and the taskbar:
+// the one built beside the executable, or the one in resources while the app
+// runs from the source.
+func iconPNG() []byte {
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), "icon.png"))
+	}
+	paths = append(paths, "icon.png", filepath.Join("resources", "icon.png"))
+
+	for _, path := range paths {
+		if png, err := os.ReadFile(path); err == nil {
+			return png
+		}
+	}
+	return nil
+}
+
 func main() {
 	mygo.App.WhenReady(func() {
 		a := &app{
@@ -1164,6 +1204,7 @@ func main() {
 			showProps: true,
 			probes:    make(chan probeResult, 4),
 			dials:     make(chan dialResult, 4),
+			asks:      make(chan *keyboardAsk, 4),
 		}
 		a.resetForm()
 
@@ -1177,6 +1218,13 @@ func main() {
 			StateKey: "main-v2",
 			Content:  ui.View(a.view),
 		})
+		// A window takes the icon it is given: Windows draws its own default
+		// one otherwise, whatever the executable carries.
+		if png := iconPNG(); png != nil {
+			if err := a.win.SetIcon(png); err != nil {
+				log.Printf("window icon: %v", err)
+			}
+		}
 		a.win.OnClosed(func() {
 			for _, t := range a.tabs {
 				t.stop()

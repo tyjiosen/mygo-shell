@@ -29,6 +29,13 @@ type Config struct {
 	// Password is used as both the password and the answer to
 	// keyboard-interactive prompts, which many servers use for 2FA.
 	Password string
+	// KeyboardInteractive answers a server that asks through
+	// keyboard-interactive: the name and instruction of the round, the
+	// questions, and whether each echoes (false for a password or a code).
+	// It may be asked more than once, as a password and then a one-time code;
+	// answers are taken as a list of the same length. It replaces the default
+	// answer of Password.
+	KeyboardInteractive func(name, instruction string, questions []string, echos []bool) ([]string, error)
 	// KeyPath is a PEM or OpenSSH private key file.
 	KeyPath       string
 	KeyPassphrase string
@@ -217,22 +224,28 @@ func authMethods(cfg Config) ([]ssh.AuthMethod, error) {
 		}
 	}
 
+	if cfg.KeyboardInteractive != nil {
+		methods = append(methods, ssh.KeyboardInteractive(cfg.KeyboardInteractive))
+	}
+
 	if cfg.Password != "" {
 		methods = append(methods, ssh.Password(cfg.Password))
-		// Servers often ask for the password through keyboard-interactive,
-		// which is also how one-time codes are requested.
-		methods = append(methods, ssh.KeyboardInteractive(
-			func(name, instruction string, questions []string, echos []bool) ([]string, error) {
-				answers := make([]string, len(questions))
-				for i := range answers {
-					answers[i] = cfg.Password
-				}
-				return answers, nil
-			}))
+		if cfg.KeyboardInteractive == nil {
+			// Servers often ask for the password through keyboard-interactive,
+			// which is also how one-time codes are requested.
+			methods = append(methods, ssh.KeyboardInteractive(
+				func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+					answers := make([]string, len(questions))
+					for i := range answers {
+						answers[i] = cfg.Password
+					}
+					return answers, nil
+				}))
+		}
 	}
 
 	if len(methods) == 0 {
-		return nil, errors.New("sshx: no authentication method: set a password, a key, or an agent")
+		return nil, errors.New("sshx: no authentication method: set a password, a key, an agent, or a keyboard-interactive answer")
 	}
 	return methods, nil
 }

@@ -15,7 +15,8 @@ A Xshell-style desktop terminal in Go: SSH sessions and local shells in one tabb
   1. 「新建会话」只填名称/主机/端口
   2. 后台探测服务器标识，显示为 `SSH2, OpenSSH_8.4p1 Debian-5+deb11u5` 这样的服务器类型
   3. 「SSH 用户名」：可勾选记住用户名
-  4. 「SSH 用户身份验证」：可选密码或公钥（自动列出 `~/.ssh` 下的私钥）并记住密码
+  4. 「SSH 用户身份验证」：可选密码、公钥（自动列出 `~/.ssh` 下的私钥）或键盘交互，并记住密码
+  5. 选「键盘交互」时，连接中由服务器逐轮提问（密码、一次性验证码等），弹窗按服务器的 echo 标志决定是否掩码
 - **连接不阻塞界面**：点确定立刻出现新标签并显示「正在连接…」，失败原因直接写在标签里；若是凭据问题，会自动重新弹出身份验证并复用同一个标签
 - **断线检测**：终端结束事件加每 5 秒一次的 `keepalive@openssh.com` 探测，探测恢复应答后状态点自动变回绿色
 - **会话操作**：右键菜单（打开 / 编辑 / 删除 / 属性）、属性窗格、双击打开
@@ -57,7 +58,6 @@ SHELL_SSH_KNOWN_HOSTS=...
 
 ## 已知限制
 
-- 暂不支持键盘交互（Keyboard Interactive）认证，只开该方式的服务器（部分 PAM / 2FA 配置）目前连不上
 - 主机密钥采用 TOFU（首次连接直接信任并记录），不会先展示指纹让人核对
 - GSSAPI、PKCS#11、CAPI 认证未实现
 - 单窗口，没有标签拖拽、分屏和会话分组
@@ -67,7 +67,7 @@ SHELL_SSH_KNOWN_HOSTS=...
 ```
 main.go             界面：会话列表、标签栏、终端面板、连接状态
 connect.go          仿 Xshell 的两步凭据弹窗
-internal/sshx       SSH 连接：密码/公钥/agent、keepalive、服务器标识探测
+internal/sshx       SSH 连接：密码/公钥/键盘交互/agent、keepalive、服务器标识探测
 internal/session    会话库（SQLite）
 internal/vault      主密钥与密码加解密
 ```
