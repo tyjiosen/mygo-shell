@@ -288,9 +288,20 @@ func (a *app) reloadSessions() {
 	}
 }
 
+// terminalOptions is how every terminal of the app behaves, local or remote:
+// the mouse works as it does in Xshell, where a selection is copied when it
+// ends and a secondary click pastes.
+func terminalOptions() terminal.Options {
+	return terminal.Options{
+		Theme:        blackTheme(),
+		CopyOnSelect: terminal.CopyOnSelectClipboard,
+		RightClick:   terminal.RightClickPaste,
+	}
+}
+
 // addLocalTab opens the user's shell in a new tab.
 func (a *app) addLocalTab() {
-	term, err := terminal.New(terminal.Options{Theme: blackTheme()})
+	term, err := terminal.New(terminalOptions())
 	if err != nil {
 		log.Printf("local terminal: %v", err)
 		return
@@ -476,10 +487,9 @@ func (a *app) dial(tab *tab, cfg sshx.Config) {
 			// The view resizes the screen and tells Conn the size it fits.
 			// ResizeByConn would leave the screen at 80×24 until the far end
 			// resized it, which a shell never does.
-			term, terr := terminal.New(terminal.Options{
-				Conn:  conn,
-				Theme: blackTheme(),
-			})
+			opts := terminalOptions()
+			opts.Conn = conn
+			term, terr := terminal.New(opts)
 			if terr != nil {
 				conn.Close()
 				result.err = terr
